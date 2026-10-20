@@ -403,19 +403,24 @@ def instance_name(base: str, num: int, args, suffix: str = "") -> str:
     return f"{base}-{args.name_start + num - 1:03d}"
 
 
-def find_instance_by_name(name: str, type_name: str | None = None, region: str | None = None) -> str | None:
-    """ID of a non-terminated instance named `name`, if any (launch idempotency check). An instance with that name but
-    another instance type or region is not ours to adopt: stop for operator review rather than count or ignore it."""
+def type_region(inst: dict) -> tuple[str | None, str | None]:
+    return (inst.get("instance_type") or {}).get("name"), (inst.get("region") or {}).get("name")
+
+
+def find_instance_by_name(name: str, types=None, region: str | None = None) -> dict | None:
+    """The non-terminated instance named `name`, if any (launch idempotency check). `types` is the allowed instance type
+    (or collection of types). An instance with that name but another type or region is not ours to adopt: stop for
+    operator review rather than count or ignore it."""
+    allowed = {types} if isinstance(types, str) else (set(types) if types else None)
     for inst in _request("GET", "/instances").get("data", []):
         if inst.get("name") != name or inst.get("status") in ("terminating", "terminated"):
             continue
-        it = (inst.get("instance_type") or {}).get("name")
-        rg = (inst.get("region") or {}).get("name")
-        if (type_name and it != type_name) or (region and rg != region):
-            notify(f"{name} exists as {it} in {rg}, not {type_name or 'the requested type'} in {region or 'any region'}: "
-                   f"name clash, stopped without launching. Check the Lambda console.")
+        it, rg = type_region(inst)
+        if (allowed and it not in allowed) or (region and rg != region):
+            notify(f"{name} exists as {it} in {rg}, not {sorted(allowed) if allowed else 'the requested type'} in "
+                   f"{region or 'any region'}: name clash, stopped without launching. Check the Lambda console.")
             sys.exit(4)
-        return inst.get("id")
+        return inst
     return None
 
 
@@ -437,10 +442,10 @@ def resolve_unknown_launch(target: str, unique_names: bool, why, type_name: str 
         deadline = time.time() + RECONCILE_SECONDS
         while True:
             try:
-                iid = find_instance_by_name(target, type_name, region)
-                if iid:
-                    print(f"[{_ts()}] {target} exists ({iid}); adopting it.")
-                    return iid
+                inst = find_instance_by_name(target, type_name, region)
+                if inst:
+                    print(f"[{_ts()}] {target} exists ({inst.get('id')}); adopting it.")
+                    return inst.get("id")
             except Exception as exc:
                 print(f"[{_ts()}] Lookup of {target} failed (will retry): {exc}")
             if time.time() >= deadline:
@@ -496,15 +501,21 @@ def poll_and_launch(args) -> None:
         if unique_names and not args.dry_run:
             while True:
                 try:
-                    existing = find_instance_by_name(target, wanted[0] if len(wanted) == 1 else None,
-                                                     args.region if args.region_only else None)
+                    existing = find_instance_by_name(target, wanted, args.region if args.region_only else None)
                     break
                 except Exception as exc:
                     print(f"[{_ts()}] Lookup of {target} failed (will retry): {exc}")
                     time.sleep(max(args.poll_interval, 5))
             if existing:
-                print(f"  {target} already exists ({existing}); adopting it, no new launch.")
-                instance_ids = [existing]
+                ex_type, ex_region = type_region(existing)
+                if locked_type is None:
+                    locked_type, locked_region = ex_type, ex_region   # the rest of the set follows the first instance
+                elif (ex_type, ex_region) != (locked_type, locked_region):
+                    notify(f"{target} exists as {ex_type} in {ex_region}, but this set is {locked_type} in {locked_region}: "
+                           f"stopped without launching. Check the Lambda console.")
+                    sys.exit(4)
+                print(f"  {target} already exists ({existing.get('id')}, {ex_type} in {ex_region}); adopting it, no new launch.")
+                instance_ids = [existing.get("id")]
         # Phase 1: poll and launch. Retried only while launches are refused outright; an accepted or unknown launch
         # request is never sent again.
         while not instance_ids:
@@ -665,7 +676,7 @@ def poll_each(args) -> None:
                                                  type_name, args.region if args.region_only else None)
                 if not existing:
                     break
-                print(f"[{_ts()}] {instance_name(base, launched + 1, args)} already exists ({existing}); adopting it.", flush=True)
+                print(f"[{_ts()}] {instance_name(base, launched + 1, args)} already exists ({existing.get('id')}); adopting it.", flush=True)
                 remaining[type_name] -= 1
                 launched += 1
 

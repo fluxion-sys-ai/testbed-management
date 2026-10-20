@@ -87,7 +87,8 @@ class NoOverLaunch(unittest.TestCase):
 
         def find(name, *a, **k):
             self.lookups += 1
-            return lookup(name, self.lookups) if lookup else None
+            iid = lookup(name, self.lookups) if lookup else None
+            return {"id": iid, "instance_type": {"name": "gpu_8x_b200_sxm6"}, "region": {"name": "us-east-1"}} if iid else None
         clock = iter(range(0, 10**7, 10))   # fake clock, 10 s per call, so the reconcile window ends
         args = types.SimpleNamespace(instance_types=["gpu_8x_b200_sxm6"], count=count, ssh_key="k", extra_ssh_keys=[],
                                      ssh_key_path=None, region="us-east-1", region_only=True, poll_interval=0,
@@ -151,7 +152,7 @@ class AdoptionChecksTypeAndRegion(unittest.TestCase):
 
     def test_match_adopted(self):
         with self.cloud([self.inst("x-003", "A", "us-east-1")]):
-            self.assertEqual(lg.find_instance_by_name("x-003", "A", "us-east-1"), "id-x-003")
+            self.assertEqual(lg.find_instance_by_name("x-003", "A", "us-east-1")["id"], "id-x-003")
 
     def test_terminated_ignored(self):
         with self.cloud([self.inst("x-003", "A", "us-east-1", status="terminated")]):
@@ -193,6 +194,54 @@ class AdoptionChecksTypeAndRegion(unittest.TestCase):
             lg.poll_each(args)
         self.assertEqual(posts, [("A", "x-003"), ("B", "x-004")])
         self.assertEqual(sorted((i["instance_type"]["name"], i["name"]) for i in cloud), [("A", "x-003"), ("B", "x-004")])
+
+
+class PhaseZeroTypeSetAndLock(unittest.TestCase):
+    """Reviewer: adopted instances must be one of the requested types, and the first instance fixes type+region."""
+
+    def inst(self, name, type_name, region):
+        return {"id": f"id-{name}", "name": name, "status": "active", "instance_type": {"name": type_name},
+                "region": {"name": region}}
+
+    def run_grab(self, cloud, wanted, region_only, capacity, count=2):
+        posts = []
+
+        def launch(**kw):
+            posts.append((kw["instance_type"], kw["region"], kw["name"]))
+            cloud.append(self.inst(kw["name"], kw["instance_type"], kw["region"]))
+            return [f"id-{kw['name']}"]
+        args = types.SimpleNamespace(instance_types=wanted, count=count, ssh_key="k", extra_ssh_keys=[], ssh_key_path=None,
+                                     region="us-east-1", region_only=region_only, poll_interval=0, name="x", name_start=3,
+                                     filesystems=[], each=False, dry_run=False)
+        with mock.patch.object(lg, "_request", lambda m, path, *a, **k: {"data": cloud} if path == "/instances" else {}), \
+             mock.patch.object(lg, "list_instance_types", lambda: capacity), \
+             mock.patch.object(lg, "launch_instances", launch), \
+             mock.patch.object(lg, "wait_for_instances", lambda ids, timeout=600: [{"id": ids[0], "status": "active"}]), \
+             mock.patch.object(lg, "notify", lambda m: None), \
+             mock.patch.object(lg, "print_network_setup", lambda inst, name: ""), \
+             mock.patch.object(lg.time, "sleep", lambda s: None):
+            lg.poll_and_launch(args)
+        return posts
+
+    def test_existing_of_unrequested_type_stops(self):
+        cloud = [self.inst("x-003", "C", "us-east-1")]
+        with self.assertRaises(SystemExit) as cm:
+            self.run_grab(cloud, ["A", "B"], False, caps(A=["us-east-1"], B=["us-east-1"]))
+        self.assertEqual(cm.exception.code, 4)
+        self.assertEqual(len(cloud), 1)   # zero launches
+
+    def test_adopted_first_instance_fixes_type_and_region(self):
+        cloud = [self.inst("x-003", "A", "us-west-1")]
+        posts = self.run_grab(cloud, ["A", "B"], False, caps(A=["us-east-1", "us-west-1"], B=["us-east-1"]))
+        self.assertEqual(posts, [("A", "us-west-1", "x-004")])
+
+    def test_adopted_second_instance_must_match_first(self):
+        # 003 launched as A/us-east-1 by this run; 004 already exists but as B -> stop, no launch for 004
+        cloud = [self.inst("x-004", "B", "us-east-1")]
+        with self.assertRaises(SystemExit) as cm:
+            self.run_grab(cloud, ["A", "B"], True, caps(A=["us-east-1"], B=["us-east-1"]))
+        self.assertEqual(cm.exception.code, 4)
+        self.assertEqual([i["name"] for i in cloud], ["x-004", "x-003"])
 
 
 if __name__ == "__main__":
