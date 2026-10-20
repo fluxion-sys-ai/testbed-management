@@ -683,7 +683,7 @@ def poll_each(args) -> None:
     # Names from the short-lived global --each numbering (<name>-<NNN>, commits e6fe674..4edb9ea) are invisible to the
     # per-type lookups below, so a restart would launch past the target: stop and ask for an explicit rename instead.
     if unique_names and not args.dry_run:
-        legacy = re.compile(re.escape(base) + r"-\d{3}")
+        legacy = re.compile(re.escape(base) + r"-\d{3,}")   # :03d is a minimum width: 003, 1000, ...
         old = [i.get("name") for i in _request("GET", "/instances").get("data", [])
                if legacy.fullmatch(i.get("name") or "") and i.get("status") not in ("terminating", "terminated")]
         if old:
