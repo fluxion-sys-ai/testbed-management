@@ -666,19 +666,32 @@ def poll_each(args) -> None:
         type_name, _, want = entry.partition(":")
         remaining[type_name] = int(want) if want else args.count
     threads: list[threading.Thread] = []
-    launched = 0   # across all types, for --name-start numbering
+    # Names are per target: <name>-<type> (one instance per type without --name-start) or <name>-<type>-<NNN> with it,
+    # numbered per type, so a name always tells which target it belongs to, whatever order capacity appeared in.
+    done = {t: 0 for t in remaining}
     unique_names = getattr(args, "name_start", None) is not None
-    # Adopt instances that already carry the next names (earlier run, or a launch whose reply was lost) before polling.
+
+    def target_name(type_name: str) -> str:
+        return instance_name(f"{base}-{type_name}", done[type_name] + 1, args)
+
+    def report(type_name, region, instance_ids):
+        t = threading.Thread(target=_report_launched, args=(args, type_name, region, instance_ids))
+        t.start()
+        threads.append(t)
+
+    # Adopt instances that already carry their target's next names (earlier run, or a launch whose reply was lost),
+    # then wait for / report them like fresh launches.
     if unique_names and not args.dry_run:
         for type_name in list(remaining):
             while remaining[type_name]:
-                existing = find_instance_by_name(instance_name(base, launched + 1, args, suffix=f"-{type_name}"),
-                                                 type_name, args.region if args.region_only else None)
+                existing = find_instance_by_name(target_name(type_name), type_name,
+                                                 args.region if args.region_only else None)
                 if not existing:
                     break
-                print(f"[{_ts()}] {instance_name(base, launched + 1, args)} already exists ({existing.get('id')}); adopting it.", flush=True)
+                print(f"[{_ts()}] {target_name(type_name)} already exists ({existing.get('id')}); adopting it.", flush=True)
                 remaining[type_name] -= 1
-                launched += 1
+                done[type_name] += 1
+                report(type_name, type_region(existing)[1], [existing.get("id")])
 
     print(f"[{_ts()}] Polling every {args.poll_interval}s for: "
           + ", ".join(f"{n}× {t}" for t, n in remaining.items()))
@@ -701,7 +714,7 @@ def poll_each(args) -> None:
                         continue
                     region = match[1]
                     print(f"[{_ts()}] CAPACITY FOUND: {type_name} in {region}", flush=True)
-                    target = instance_name(base, launched + 1, args, suffix=f"-{type_name}")
+                    target = target_name(type_name)
                     try:
                         instance_ids = launch_instances(
                             instance_type=type_name,
@@ -724,17 +737,12 @@ def poll_each(args) -> None:
                         instance_ids = [resolve_unknown_launch(target, unique_names, "launch reply had no instance ID",
                                                                type_name, region)]
                     remaining[type_name] -= 1
-                    launched += 1
+                    done[type_name] += 1
                     print(f"[{_ts()}] {type_name}: launched {instance_ids} "
                           f"({remaining[type_name]} left)", flush=True)
                     if args.dry_run:
                         continue
-                    t = threading.Thread(
-                        target=_report_launched,
-                        args=(args, type_name, region, instance_ids),
-                    )
-                    t.start()
-                    threads.append(t)
+                    report(type_name, region, instance_ids)
                 if attempt % 60 == 0:
                     print(f"[{_ts()}] Attempt {attempt}: still waiting for "
                           f"{ {k: v for k, v in remaining.items() if v} }", flush=True)

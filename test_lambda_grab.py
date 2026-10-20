@@ -170,7 +170,7 @@ class AdoptionChecksTypeAndRegion(unittest.TestCase):
                 lg.find_instance_by_name("x-003", "A", "us-east-1")
 
     def test_each_lost_reply_does_not_starve_other_type(self):
-        # 1x A + 1x B; A's launch is accepted but its reply is lost. Expected: A adopted as 003, B launched as 004 (type B).
+        # 1x A + 1x B; A's launch is accepted but its reply is lost. Expected: A adopted as x-A-003, B launched as x-B-003.
         cloud, posts = [], []
 
         def launch(**kw):
@@ -192,8 +192,8 @@ class AdoptionChecksTypeAndRegion(unittest.TestCase):
              mock.patch.object(lg.time, "monotonic", lambda: next(clock)), \
              mock.patch.object(lg.time, "sleep", lambda s: None):
             lg.poll_each(args)
-        self.assertEqual(posts, [("A", "x-003"), ("B", "x-004")])
-        self.assertEqual(sorted((i["instance_type"]["name"], i["name"]) for i in cloud), [("A", "x-003"), ("B", "x-004")])
+        self.assertEqual(posts, [("A", "x-A-003"), ("B", "x-B-003")])
+        self.assertEqual(sorted((i["instance_type"]["name"], i["name"]) for i in cloud), [("A", "x-A-003"), ("B", "x-B-003")])
 
 
 class PhaseZeroTypeSetAndLock(unittest.TestCase):
@@ -242,6 +242,53 @@ class PhaseZeroTypeSetAndLock(unittest.TestCase):
             self.run_grab(cloud, ["A", "B"], True, caps(A=["us-east-1"], B=["us-east-1"]))
         self.assertEqual(cm.exception.code, 4)
         self.assertEqual([i["name"] for i in cloud], ["x-004", "x-003"])
+
+
+class EachResumeAndReport(unittest.TestCase):
+    """Reviewer: --each names must survive restarts whatever order capacity came in, and adopted nodes are reported."""
+
+    def inst(self, name, type_name, region="us-east-1", status="active"):
+        return {"id": f"id-{name}", "name": name, "status": status, "instance_type": {"name": type_name},
+                "region": {"name": region}}
+
+    def run_each(self, cloud, capacity_seq):
+        posts, reported = [], []
+        polls = iter(capacity_seq)
+
+        def launch(**kw):
+            posts.append((kw["instance_type"], kw["name"]))
+            cloud.append(self.inst(kw["name"], kw["instance_type"], kw["region"], status="booting"))
+            return [f"id-{kw['name']}"]
+        clock = iter(range(0, 10**7, 10))
+        args = types.SimpleNamespace(instance_types=["A", "B"], count=1, ssh_key="k", extra_ssh_keys=[], ssh_key_path=None,
+                                     region="us-east-1", region_only=True, poll_interval=0, name="x", name_start=3,
+                                     filesystems=[], each=True, dry_run=False)
+        with mock.patch.object(lg, "_request", lambda m, path, *a, **k: {"data": cloud} if path == "/instances" else {}), \
+             mock.patch.object(lg, "list_instance_types", lambda: next(polls)), \
+             mock.patch.object(lg, "launch_instances", launch), \
+             mock.patch.object(lg, "_report_launched", lambda a, t, r, ids: reported.append((t, ids[0]))), \
+             mock.patch.object(lg, "notify", lambda m: None), \
+             mock.patch.object(lg.time, "time", lambda: next(clock)), \
+             mock.patch.object(lg.time, "monotonic", lambda: next(clock)), \
+             mock.patch.object(lg.time, "sleep", lambda s: None):
+            lg.poll_each(args)
+        return posts, reported
+
+    def test_restart_after_b_first(self):
+        cloud = []
+        # first run: only B has capacity at first -> B launched as x-B-003; stop before A (simulated by a 2-poll run)
+        posts, _ = self.run_each(cloud, [caps(A=[], B=["us-east-1"]), caps(A=["us-east-1"], B=[])])
+        self.assertEqual(posts, [("B", "x-B-003"), ("A", "x-A-003")])
+        # restart the same command with both present: both adopted, no launch, no exit
+        posts2, reported2 = self.run_each(cloud, [caps(A=["us-east-1"], B=["us-east-1"])] * 3)
+        self.assertEqual(posts2, [])
+        self.assertEqual(sorted(reported2), [("A", "id-x-A-003"), ("B", "id-x-B-003")])
+
+    def test_restart_with_only_b_present(self):
+        cloud = [self.inst("x-B-003", "B", status="booting")]
+        posts, reported = self.run_each(cloud, [caps(A=["us-east-1"], B=[])] * 3)
+        self.assertEqual(posts, [("A", "x-A-003")])           # B adopted (no exit 4), A launched
+        self.assertEqual(sorted(reported), [("A", "id-x-A-003"), ("B", "id-x-B-003")])   # adopted B reported too
 
 
 if __name__ == "__main__":
