@@ -291,5 +291,14 @@ class EachResumeAndReport(unittest.TestCase):
         self.assertEqual(sorted(reported), [("A", "id-x-A-003"), ("B", "id-x-B-003")])   # adopted B reported too
 
 
+    def test_legacy_global_names_stop(self):
+        # reviewer: an old-scheme --each node x-003 must not be ignored (that would launch x-A-003 + x-B-003 = 3 total)
+        cloud = [self.inst("x-003", "B")]
+        with self.assertRaises(SystemExit) as cm:
+            self.run_each(cloud, [caps(A=["us-east-1"], B=["us-east-1"])] * 3)
+        self.assertEqual(cm.exception.code, 4)
+        self.assertEqual([i["name"] for i in cloud], ["x-003"])   # nothing launched
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

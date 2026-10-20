@@ -30,6 +30,7 @@ Auth:
 
 import argparse
 import json
+import re
 import os
 import shlex
 import smtplib
@@ -678,6 +679,17 @@ def poll_each(args) -> None:
         t = threading.Thread(target=_report_launched, args=(args, type_name, region, instance_ids))
         t.start()
         threads.append(t)
+
+    # Names from the short-lived global --each numbering (<name>-<NNN>, commits e6fe674..4edb9ea) are invisible to the
+    # per-type lookups below, so a restart would launch past the target: stop and ask for an explicit rename instead.
+    if unique_names and not args.dry_run:
+        legacy = re.compile(re.escape(base) + r"-\d{3}")
+        old = [i.get("name") for i in _request("GET", "/instances").get("data", [])
+               if legacy.fullmatch(i.get("name") or "") and i.get("status") not in ("terminating", "terminated")]
+        if old:
+            notify(f"--each found instances named in the old global scheme ({', '.join(sorted(old))}); new names are "
+                   f"<name>-<type>-<NNN>. Rename them in the Lambda console (or terminate them), then rerun. Stopped.")
+            sys.exit(4)
 
     # Adopt instances that already carry their target's next names (earlier run, or a launch whose reply was lost),
     # then wait for / report them like fresh launches.
