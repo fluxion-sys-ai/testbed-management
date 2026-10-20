@@ -41,6 +41,8 @@ python lambda_grab.py grab \
     [--extra-ssh-keys key2 key3] \
     [--ssh-key-path ~/.ssh/id_rsa] \
     [--region us-west-1] \
+    [--region-only] \
+    [--name-start 3] \
     [--poll-interval 30] \
     [--filesystems fs-abc123] \
     [--each] \
@@ -53,8 +55,10 @@ python lambda_grab.py grab \
 - `--extra-ssh-keys` — additional key names to inject into each instance after launch (fetched from Lambda by name and appended to `authorized_keys`)
 - `--ssh-key-path` — path to the private key file for `--ssh-key`, used when injecting extra keys (defaults to your SSH agent)
 - `--region` — preferred region; falls back to any available region if not found
+- `--region-only` — launch only in `--region`; capacity elsewhere is ignored (without it, the first instance can land in another region and the rest follow it)
 - `--poll-interval` — seconds between API polls, fractional allowed (default: 30)
 - `--name` — base name for launched instances (default: `exp-<timestamp>`)
+- `--name-start N` — give each instance its own name `<name>-<NNN>`, numbered from N (e.g. `--name b200-us-east-1 --name-start 3` gives `b200-us-east-1-003`, `-004`); without it every instance gets the base name
 - `--filesystems` — Lambda filesystem names to attach (optional)
 - `--each` — treat every `--instance-types` entry as its own target and launch `--count` of **each** (instead of the first available). One `/instance-types` request per interval serves all targets, so polling stays within Lambda's 1 req/s limit (despite the nominal 1 req/s, use `--poll-interval 2`: 1 s and 1.5 s both hit Cloudflare 429 bans within about a minute; 429s trigger exponential backoff); launches run in background threads so polling doesn't stall
 - `--dry-run` — print what would happen without actually launching
@@ -65,6 +69,15 @@ Example: poll 1x, 2x and 8x B200 every 2 s and grab one of each:
 python lambda_grab.py grab --each --count 1 --ssh-key my-key --poll-interval 2 \
     --instance-types gpu_1x_b200_sxm6 gpu_2x_b200_sxm6 gpu_8x_b200_sxm6
 ```
+
+Example: grab two 8x B200 in us-east-1 only, named after the existing fleet (b200-us-east-1-001/-002 exist):
+
+```bash
+python lambda_grab.py grab --instance-types gpu_8x_b200_sxm6 --count 2 --ssh-key my-key \
+    --region us-east-1 --region-only --name b200-us-east-1 --name-start 3 --poll-interval 2
+```
+
+Tests (offline, no API calls): `python3 test_lambda_grab.py`.
 
 ### Notifications
 

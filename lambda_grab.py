@@ -161,10 +161,12 @@ def find_candidate(
     instance_types: dict,
     wanted: list[str],
     preferred_region: str | None,
+    region_only: bool = False,
 ) -> tuple[str, str] | None:
     """
     Return (instance_type, region) for the first entry in `wanted` that has
-    capacity. Respects preferred_region if supplied.
+    capacity. Respects preferred_region if supplied; with region_only, capacity
+    elsewhere does not count.
     """
     for type_name in wanted:
         info = instance_types.get(type_name)
@@ -175,6 +177,8 @@ def find_candidate(
             continue
         if preferred_region and preferred_region in regions:
             return type_name, preferred_region
+        if region_only:
+            continue
         return type_name, regions[0]
     return None
 
@@ -383,6 +387,14 @@ def cmd_list_types(args) -> None:
     print()
 
 
+def instance_name(base: str, num: int, args, suffix: str = "") -> str:
+    """Name of the num-th launched instance (1-based). With --name-start N the instances are numbered
+    <base>-<NNN> from N (e.g. b200-us-east-1-003, -004), so every instance gets a distinct name."""
+    if getattr(args, "name_start", None) is None:
+        return f"{base}{suffix}"
+    return f"{base}-{args.name_start + num - 1:03d}"
+
+
 def poll_and_launch(args) -> None:
     wanted = args.instance_types
     count = args.count
@@ -416,7 +428,7 @@ def poll_and_launch(args) -> None:
                     if not match:
                         print(f"[{_ts()}] Attempt {attempt}: {locked_type} in {locked_region} no longer has capacity. Retrying in {args.poll_interval}s…")
                 else:
-                    match = find_candidate(instance_types, wanted, args.region)
+                    match = find_candidate(instance_types, wanted, args.region, args.region_only)
                     if not match:
                         print(f"[{_ts()}] Attempt {attempt}: no capacity for {wanted}. Retrying in {args.poll_interval}s…")
 
@@ -434,7 +446,7 @@ def poll_and_launch(args) -> None:
                         region=region,
                         count=1,
                         ssh_key=args.ssh_key,
-                        name=name,
+                        name=instance_name(name, instance_num, args),
                         filesystem_ids=args.filesystems or [],
                         dry_run=args.dry_run,
                     )
@@ -529,6 +541,7 @@ def poll_each(args) -> None:
         type_name, _, want = entry.partition(":")
         remaining[type_name] = int(want) if want else args.count
     threads: list[threading.Thread] = []
+    launched = 0   # across all types, for --name-start numbering
 
     print(f"[{_ts()}] Polling every {args.poll_interval}s for: "
           + ", ".join(f"{n}× {t}" for t, n in remaining.items()))
@@ -546,7 +559,7 @@ def poll_each(args) -> None:
                 for type_name, left in remaining.items():
                     if not left:
                         continue
-                    match = find_candidate(instance_types, [type_name], args.region)
+                    match = find_candidate(instance_types, [type_name], args.region, args.region_only)
                     if not match:
                         continue
                     region = match[1]
@@ -557,7 +570,7 @@ def poll_each(args) -> None:
                             region=region,
                             count=1,
                             ssh_key=args.ssh_key,
-                            name=f"{base}-{type_name}",
+                            name=instance_name(base, launched + 1, args, suffix=f"-{type_name}"),
                             filesystem_ids=args.filesystems or [],
                             dry_run=args.dry_run,
                         )
@@ -566,6 +579,7 @@ def poll_each(args) -> None:
                         print(f"[{_ts()}] Launch of {type_name} failed, still polling: {exc}", flush=True)
                         continue
                     remaining[type_name] -= 1
+                    launched += 1
                     print(f"[{_ts()}] {type_name}: launched {instance_ids} "
                           f"({remaining[type_name]} left)", flush=True)
                     if args.dry_run:
@@ -630,7 +644,11 @@ def parse_args():
     )
     grab.add_argument(
         "--region", default=None,
-        help="Preferred region (e.g. us-west-1). Falls back to any region if unavailable.",
+        help="Preferred region (e.g. us-west-1). Falls back to any region if unavailable, unless --region-only.",
+    )
+    grab.add_argument(
+        "--region-only", action="store_true",
+        help="Launch only in --region; capacity in other regions is ignored.",
     )
     grab.add_argument(
         "--poll-interval", type=float, default=30, metavar="SECONDS",
@@ -639,6 +657,11 @@ def parse_args():
     grab.add_argument(
         "--name", default=None,
         help="Base name for the instances (default: exp-<timestamp>).",
+    )
+    grab.add_argument(
+        "--name-start", type=int, default=None, metavar="N",
+        help="Give each instance its own name <name>-<NNN>, numbered from N (e.g. --name b200-us-east-1 "
+             "--name-start 3 -> b200-us-east-1-003, -004). Without it every instance gets the base name.",
     )
     grab.add_argument(
         "--filesystems", nargs="*", default=[],
@@ -658,6 +681,8 @@ def parse_args():
     if not args.command:
         p.print_help()
         sys.exit(1)
+    if args.command == "grab" and args.region_only and not args.region:
+        p.error("--region-only needs --region")
     return args
 
 
