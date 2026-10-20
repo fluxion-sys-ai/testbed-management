@@ -395,14 +395,41 @@ def instance_name(base: str, num: int, args, suffix: str = "") -> str:
     return f"{base}-{args.name_start + num - 1:03d}"
 
 
+def find_instance_by_name(name: str) -> str | None:
+    """ID of a non-terminated instance named `name`, if any (used as a launch idempotency check)."""
+    for inst in _request("GET", "/instances").get("data", []):
+        if inst.get("name") == name and inst.get("status") not in ("terminating", "terminated"):
+            return inst.get("id")
+    return None
+
+
+def await_instance(instance_ids: list[str], poll_interval: float) -> dict:
+    """Wait for an already-launched instance. Retries only the status polling, never the launch: once the launch
+    request was accepted the instance exists (and bills), whatever happens while it boots."""
+    while True:
+        try:
+            return wait_for_instances(instance_ids)[0]
+        except TimeoutError:
+            print(f"[{_ts()}] {instance_ids} not active yet; still waiting (no new launch).")
+        except RuntimeError as exc:
+            if "failed" in str(exc):   # error/terminated: report it, do not replace it
+                print(f"[{_ts()}] {instance_ids} failed to come up: {exc}. Not relaunching.")
+                return {"id": instance_ids[0], "status": "failed"}
+            print(f"[{_ts()}] Status check error (will retry, no new launch): {exc}")
+        except Exception as exc:
+            print(f"[{_ts()}] Status check error (will retry, no new launch): {exc}")
+        time.sleep(max(poll_interval, 15))
+
+
 def poll_and_launch(args) -> None:
     wanted = args.instance_types
     count = args.count
     name = args.name or f"exp-{int(time.time())}"
+    unique_names = getattr(args, "name_start", None) is not None
 
     print(f"[{_ts()}] Polling Lambda Cloud for {count}× one of: {wanted}")
     if args.region:
-        print(f"  Preferred region: {args.region}")
+        print(f"  Preferred region: {args.region}" + (" (only)" if args.region_only else ""))
     print(f"  Poll interval: {args.poll_interval}s")
     if args.dry_run:
         print("  DRY RUN — no instances will actually be launched.")
@@ -413,8 +440,11 @@ def poll_and_launch(args) -> None:
     locked_region: str | None = None
 
     for instance_num in range(1, count + 1):
-        print(f"[{_ts()}] Acquiring instance {instance_num}/{count}…")
+        target = instance_name(name, instance_num, args)
+        print(f"[{_ts()}] Acquiring instance {instance_num}/{count} ({target})…")
         attempt = 0
+        instance_ids: list[str] = []
+        # Phase 1: poll and launch. Retried until one launch request is accepted; nothing after that is retried here.
         while True:
             attempt += 1
             try:
@@ -439,6 +469,13 @@ def poll_and_launch(args) -> None:
                         locked_region = region
 
                     print(f"[{_ts()}] CAPACITY FOUND: {type_name} in {region}")
+                    # A launch request that errored on our side (timeout, dropped connection) may still have been
+                    # accepted. With unique names the name tells: adopt the instance instead of launching another.
+                    existing = find_instance_by_name(target) if unique_names and not args.dry_run else None
+                    if existing:
+                        print(f"  {target} already exists ({existing}); adopting it, no new launch.")
+                        instance_ids = [existing]
+                        break
                     print(f"Launching instance {instance_num}/{count}…")
 
                     instance_ids = launch_instances(
@@ -446,7 +483,7 @@ def poll_and_launch(args) -> None:
                         region=region,
                         count=1,
                         ssh_key=args.ssh_key,
-                        name=instance_name(name, instance_num, args),
+                        name=target,
                         filesystem_ids=args.filesystems or [],
                         dry_run=args.dry_run,
                     )
@@ -454,31 +491,10 @@ def poll_and_launch(args) -> None:
                     if args.dry_run:
                         print(f"  [dry-run] Launch call complete for instance {instance_num}/{count}.")
                         break
-
-                    print(f"  Launched instance ID: {instance_ids}")
-
-                    instances = wait_for_instances(instance_ids)
-                    inst = instances[0]
-                    all_instances.append(inst)
-
-                    # Inject extra SSH keys fetched by name from Lambda
-                    if getattr(args, "extra_ssh_keys", None):
-                        extra_public_keys = get_public_keys_by_name(args.extra_ssh_keys)
-                        inject_extra_ssh_keys(
-                            instances,
-                            extra_public_keys,
-                            ssh_key_path=getattr(args, "ssh_key_path", None),
-                        )
-
-                    ip = inst.get("ip", "N/A")
-                    priv = inst.get("private_ip", "N/A")
-                    iid = inst.get("id", "?")
-                    notify(
-                        f"Grabbed instance {instance_num}/{count}: {type_name} in {region}\n"
-                        f"  ID: {iid}  public={ip}  private={priv}\n"
-                        f"  SSH: ssh ubuntu@{ip}"
-                    )
-                    break
+                    if instance_ids:
+                        print(f"  Launched instance ID: {instance_ids}")
+                        break
+                    print(f"[{_ts()}] Launch returned no instance ID; will retry.")
 
             except KeyboardInterrupt:
                 print("\nInterrupted by user. Exiting.")
@@ -490,12 +506,47 @@ def poll_and_launch(args) -> None:
 
             time.sleep(args.poll_interval)
 
+        if args.dry_run:
+            continue
+
+        # Phase 2: wait, inject keys, notify. Failures here never trigger another launch.
+        try:
+            inst = await_instance(instance_ids, args.poll_interval)
+        except KeyboardInterrupt:
+            print(f"\nInterrupted while waiting for {instance_ids} (launched). Exiting.")
+            return
+        all_instances.append(inst)
+        if inst.get("status") == "failed":
+            notify(f"Launched instance {instance_num}/{count} ({target}, {instance_ids[0]}) failed to come up; not replaced.")
+            continue
+
+        # Inject extra SSH keys fetched by name from Lambda
+        if getattr(args, "extra_ssh_keys", None):
+            try:
+                inject_extra_ssh_keys(
+                    [inst],
+                    get_public_keys_by_name(args.extra_ssh_keys),
+                    ssh_key_path=getattr(args, "ssh_key_path", None),
+                )
+            except Exception as exc:
+                print(f"[{_ts()}] Extra key injection failed (instance kept): {exc}")
+
+        ip = inst.get("ip", "N/A")
+        priv = inst.get("private_ip", "N/A")
+        iid = inst.get("id", "?")
+        notify(
+            f"Grabbed instance {instance_num}/{count}: {locked_type} in {locked_region} ({target})\n"
+            f"  ID: {iid}  public={ip}  private={priv}\n"
+            f"  SSH: ssh ubuntu@{ip}"
+        )
+
     if args.dry_run:
         print(f"  [dry-run] All {count} launch call(s) complete. Exiting.")
         return
 
-    if count > 1 and all_instances:
-        net_info = print_network_setup(all_instances, name)
+    ready = [i for i in all_instances if i.get("status") != "failed"]
+    if count > 1 and ready:
+        net_info = print_network_setup(ready, name)
         if net_info:
             notify(f"Private network — add to /etc/hosts on each node:\n{net_info}")
 
@@ -564,13 +615,21 @@ def poll_each(args) -> None:
                         continue
                     region = match[1]
                     print(f"[{_ts()}] CAPACITY FOUND: {type_name} in {region}", flush=True)
+                    target = instance_name(base, launched + 1, args, suffix=f"-{type_name}")
+                    if getattr(args, "name_start", None) is not None and not args.dry_run:
+                        existing = find_instance_by_name(target)   # an earlier errored launch may have been accepted
+                        if existing:
+                            print(f"[{_ts()}] {target} already exists ({existing}); adopting it, no new launch.", flush=True)
+                            remaining[type_name] -= 1
+                            launched += 1
+                            continue
                     try:
                         instance_ids = launch_instances(
                             instance_type=type_name,
                             region=region,
                             count=1,
                             ssh_key=args.ssh_key,
-                            name=instance_name(base, launched + 1, args, suffix=f"-{type_name}"),
+                            name=target,
                             filesystem_ids=args.filesystems or [],
                             dry_run=args.dry_run,
                         )
