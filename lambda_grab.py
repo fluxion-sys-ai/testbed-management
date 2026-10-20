@@ -521,6 +521,7 @@ def poll_and_launch(args) -> None:
         # request is never sent again.
         while not instance_ids:
             attempt += 1
+            started = time.monotonic()
             try:
                 instance_types = list_instance_types()
 
@@ -579,7 +580,8 @@ def poll_and_launch(args) -> None:
             except Exception as exc:
                 print(f"[{_ts()}] Error (will retry): {exc}")
 
-            time.sleep(args.poll_interval)
+            # fixed cadence: one poll every poll_interval seconds, request time included
+            time.sleep(max(0.0, args.poll_interval - (time.monotonic() - started)))
 
         if args.dry_run:
             continue

@@ -308,5 +308,29 @@ class EachResumeAndReport(unittest.TestCase):
         self.assertEqual([i["name"] for i in cloud], ["x-1000"])
 
 
+class Cadence(unittest.TestCase):
+    def test_poll_every_interval_including_request_time(self):
+        # 3 polls without capacity, then capacity; each poll "takes" 0.5 s -> sleeps of 1.5 s keep a 2.0 s cadence
+        polls = iter([caps(gpu_8x_b200_sxm6=[])] * 3 + [caps(gpu_8x_b200_sxm6=["us-east-1"])])
+        now = [0.0]
+        sleeps = []
+
+        def poll():
+            now[0] += 0.5
+            return next(polls)
+        args = types.SimpleNamespace(instance_types=["gpu_8x_b200_sxm6"], count=1, ssh_key="k", extra_ssh_keys=[],
+                                     ssh_key_path=None, region="us-east-1", region_only=True, poll_interval=2.0,
+                                     name="x", name_start=3, filesystems=[], each=False, dry_run=False)
+        with mock.patch.object(lg, "list_instance_types", poll), \
+             mock.patch.object(lg, "launch_instances", lambda **kw: ["id1"]), \
+             mock.patch.object(lg, "find_instance_by_name", lambda *a, **k: None), \
+             mock.patch.object(lg, "wait_for_instances", lambda ids, timeout=600: [{"id": ids[0], "status": "active"}]), \
+             mock.patch.object(lg, "notify", lambda m: None), \
+             mock.patch.object(lg.time, "monotonic", lambda: now[0]), \
+             mock.patch.object(lg.time, "sleep", lambda s: (sleeps.append(s), now.__setitem__(0, now[0] + s))):
+            lg.poll_and_launch(args)
+        self.assertEqual(sleeps, [1.5, 1.5, 1.5])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -56,7 +56,7 @@ python lambda_grab.py grab \
 - `--ssh-key-path` — path to the private key file for `--ssh-key`, used when injecting extra keys (defaults to your SSH agent)
 - `--region` — preferred region; falls back to any available region if not found
 - `--region-only` — launch only in `--region`; capacity elsewhere is ignored (without it, the first instance can land in another region and the rest follow it)
-- `--poll-interval` — seconds between API polls, fractional allowed (default: 30)
+- `--poll-interval` — seconds between the starts of API polls (request time included), fractional allowed (default: 30)
 - `--name` — base name for launched instances (default: `exp-<timestamp>`)
 - `--name-start N` — give each instance its own name `<name>-<NNN>`, numbered from N (e.g. `--name b200-us-east-1 --name-start 3` gives `b200-us-east-1-003`, `-004`); without it every instance gets the base name. With `--each`, names are per target: `<name>-<type>-<NNN>`, numbered per type, so a restart maps every existing name back to its target. (Between commits e6fe674 and 4edb9ea, `--each --name-start` used global names `<name>-<NNN>`; if such instances exist the tool stops with exit 4 and asks you to rename them first.)
 - `--filesystems` — Lambda filesystem names to attach (optional)
