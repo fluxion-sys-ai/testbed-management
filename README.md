@@ -77,10 +77,16 @@ python lambda_grab.py grab --instance-types gpu_8x_b200_sxm6 --count 2 --ssh-key
     --region us-east-1 --region-only --name b200-us-east-1 --name-start 3 --poll-interval 2
 ```
 
-Once a launch request is accepted it is never repeated: waiting for the instance to boot, status errors and
-extra-key injection are retried or reported on their own, and an instance that fails to come up is reported, not
-replaced. With `--name-start`, a launch request that errored on our side is checked by name before trying again,
-so an accepted-but-unacknowledged launch is adopted rather than duplicated.
+A launch request that was, or may have been, accepted is never sent again:
+
+- waiting for the instance to boot, status errors and extra-key injection are retried or reported on their own, and
+  an instance that fails to come up is reported, not replaced;
+- only a 4xx answer (refused: no capacity, bad request, rate limit) is retried. Any other launch error (5xx,
+  timeout, lost reply) has an unknown outcome: with `--name-start` the tool looks for the instance by name for
+  10 minutes and adopts it; if it never appears, or without `--name-start`, it stops with exit code 3 for you to
+  check the console;
+- with `--name-start`, names that already exist are adopted before polling (e.g. after a restart), but only if
+  their instance type and region match; a same-name instance of another type or region stops the tool (exit 4).
 
 Tests (offline, no API calls): `python3 test_lambda_grab.py`.
 

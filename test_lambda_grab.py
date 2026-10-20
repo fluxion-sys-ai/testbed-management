@@ -48,7 +48,7 @@ class GrabLoop(unittest.TestCase):
                                      name="b200-us-east-1", name_start=3, filesystems=[], each=False, dry_run=False)
         with mock.patch.object(lg, "list_instance_types", lambda: next(polls)), \
              mock.patch.object(lg, "launch_instances", launch), \
-             mock.patch.object(lg, "find_instance_by_name", lambda n: None), \
+             mock.patch.object(lg, "find_instance_by_name", lambda *a, **k: None), \
              mock.patch.object(lg, "wait_for_instances", lambda ids, timeout=600: [{"id": i, "ip": "1.2.3.4", "private_ip": "10.0.0.1", "name": i} for i in ids]), \
              mock.patch.object(lg, "notify", lambda m: None), \
              mock.patch.object(lg, "print_network_setup", lambda inst, name: ""), \
@@ -64,19 +64,19 @@ class GrabLoop(unittest.TestCase):
 
 
 class NoOverLaunch(unittest.TestCase):
-    """Once a launch request is accepted it is never repeated, whatever happens while the instance boots."""
+    """A launch request that was or may have been accepted is never sent again."""
 
-    def grab(self, waits, launch_errors=(), existing=None, count=2):
-        polls = iter([caps(gpu_8x_b200_sxm6=["us-east-1"])] * 50)
-        launches, waits = [], list(waits)
-        errs = list(launch_errors)
+    def grab(self, waits=(), launch_errors=(), lookup=None, count=2, capacity=None):
+        polls = iter(capacity or [caps(gpu_8x_b200_sxm6=["us-east-1"])] * 200)
+        launches, waits, errs = [], list(waits), list(launch_errors)
+        self.lookups = 0
 
         def launch(**kw):
+            launches.append(kw["name"])
             if errs:
                 e = errs.pop(0)
                 if e:
                     raise e
-            launches.append(kw["name"])
             return [f"id-{kw['name']}"]
 
         def wait(ids, timeout=600):
@@ -84,21 +84,27 @@ class NoOverLaunch(unittest.TestCase):
             if isinstance(w, Exception):
                 raise w
             return [{"id": ids[0], "status": w, "ip": "1.2.3.4", "private_ip": "10.0.0.1"}]
+
+        def find(name, *a, **k):
+            self.lookups += 1
+            return lookup(name, self.lookups) if lookup else None
+        clock = iter(range(0, 10**7, 10))   # fake clock, 10 s per call, so the reconcile window ends
         args = types.SimpleNamespace(instance_types=["gpu_8x_b200_sxm6"], count=count, ssh_key="k", extra_ssh_keys=[],
                                      ssh_key_path=None, region="us-east-1", region_only=True, poll_interval=0,
                                      name="b200-us-east-1", name_start=3, filesystems=[], each=False, dry_run=False)
         with mock.patch.object(lg, "list_instance_types", lambda: next(polls)), \
              mock.patch.object(lg, "launch_instances", launch), \
              mock.patch.object(lg, "wait_for_instances", wait), \
-             mock.patch.object(lg, "find_instance_by_name", lambda n: (existing or {}).get(n)), \
+             mock.patch.object(lg, "find_instance_by_name", find), \
              mock.patch.object(lg, "notify", lambda m: None), \
              mock.patch.object(lg, "print_network_setup", lambda inst, name: ""), \
+             mock.patch.object(lg.time, "time", lambda: next(clock)), \
              mock.patch.object(lg.time, "sleep", lambda s: None):
             lg.poll_and_launch(args)
         return launches
 
     def test_wait_timeout_does_not_relaunch(self):
-        # reviewer's case: first wait times out -> previously re-POSTed (3 VMs: 003, 003, 004)
+        # reviewer's first case: first wait times out -> previously re-POSTed (3 VMs: 003, 003, 004)
         self.assertEqual(self.grab([TimeoutError("slow boot"), "active", "active"]), ["b200-us-east-1-003", "b200-us-east-1-004"])
 
     def test_status_errors_do_not_relaunch(self):
@@ -109,10 +115,84 @@ class NoOverLaunch(unittest.TestCase):
         self.assertEqual(self.grab([RuntimeError("One or more instances failed: ['error']"), "active"]),
                          ["b200-us-east-1-003", "b200-us-east-1-004"])
 
-    def test_errored_launch_that_was_accepted_is_adopted(self):
-        # POST raised (e.g. read timeout) but the instance exists under its name: adopt, do not POST again
-        self.assertEqual(self.grab([], launch_errors=[OSError("read timed out")],
-                                   existing={"b200-us-east-1-003": "id-adopted"}), ["b200-us-east-1-004"])
+    def test_unknown_outcome_instance_appears_late(self):
+        # reviewer's second case: lookup misses before the POST, POST times out, the instance shows up only on a later
+        # lookup (eventual visibility) -> adopted, exactly one POST for 003
+        def lookup(name, n):
+            return "id-late" if name.endswith("-003") and n >= 4 else None
+        self.assertEqual(self.grab(launch_errors=[TimeoutError("read timed out")], lookup=lookup, count=1),
+                         ["b200-us-east-1-003"])
+
+    def test_unknown_outcome_never_visible_stops(self):
+        with self.assertRaises(SystemExit) as cm:   # one POST (502: outcome unknown), never visible -> stop, no retry
+            self.grab(launch_errors=[lg.ApiHTTPError(502, "HTTP 502 POST launch")], count=1)
+        self.assertEqual(cm.exception.code, 3)
+
+    def test_definite_rejection_is_retried(self):
+        self.assertEqual(self.grab(launch_errors=[lg.ApiHTTPError(400, "insufficient capacity")], count=1),
+                         ["b200-us-east-1-003", "b200-us-east-1-003"])
+
+    def test_existing_adopted_without_capacity(self):
+        # 003 exists, no capacity anywhere for a while: 003 is adopted (lookup before any capacity check), 004 waits
+        cap = [caps(gpu_8x_b200_sxm6=[])] * 3 + [caps(gpu_8x_b200_sxm6=["us-east-1"])] * 50
+        launches = self.grab(lookup=lambda name, n: "id-003" if name.endswith("-003") else None, capacity=cap)
+        self.assertEqual(launches, ["b200-us-east-1-004"])
+        self.assertGreaterEqual(self.lookups, 2)
+
+
+class AdoptionChecksTypeAndRegion(unittest.TestCase):
+    """Name adoption must match the intended instance type and region (reviewer: --each A/B ordinal clash)."""
+
+    def cloud(self, insts):
+        return mock.patch.object(lg, "_request", lambda m, path, *a, **k: {"data": insts} if path == "/instances" else {})
+
+    def inst(self, name, type_name, region, status="active"):
+        return {"id": f"id-{name}", "name": name, "status": status, "instance_type": {"name": type_name}, "region": {"name": region}}
+
+    def test_match_adopted(self):
+        with self.cloud([self.inst("x-003", "A", "us-east-1")]):
+            self.assertEqual(lg.find_instance_by_name("x-003", "A", "us-east-1"), "id-x-003")
+
+    def test_terminated_ignored(self):
+        with self.cloud([self.inst("x-003", "A", "us-east-1", status="terminated")]):
+            self.assertIsNone(lg.find_instance_by_name("x-003", "A", "us-east-1"))
+
+    def test_type_clash_stops(self):
+        with self.cloud([self.inst("x-003", "A", "us-east-1")]), mock.patch.object(lg, "notify", lambda m: None):
+            with self.assertRaises(SystemExit) as cm:
+                lg.find_instance_by_name("x-003", "B", "us-east-1")
+        self.assertEqual(cm.exception.code, 4)
+
+    def test_region_clash_stops(self):
+        with self.cloud([self.inst("x-003", "A", "us-west-1")]), mock.patch.object(lg, "notify", lambda m: None):
+            with self.assertRaises(SystemExit):
+                lg.find_instance_by_name("x-003", "A", "us-east-1")
+
+    def test_each_lost_reply_does_not_starve_other_type(self):
+        # 1x A + 1x B; A's launch is accepted but its reply is lost. Expected: A adopted as 003, B launched as 004 (type B).
+        cloud, posts = [], []
+
+        def launch(**kw):
+            posts.append((kw["instance_type"], kw["name"]))
+            cloud.append(self.inst(kw["name"], kw["instance_type"], kw["region"], status="booting"))
+            if kw["instance_type"] == "A" and len([p for p in posts if p[0] == "A"]) == 1:
+                raise TimeoutError("reply lost")
+            return [f"id-{kw['name']}"]
+        clock = iter(range(0, 10**7, 10))
+        args = types.SimpleNamespace(instance_types=["A", "B"], count=1, ssh_key="k", extra_ssh_keys=[], ssh_key_path=None,
+                                     region="us-east-1", region_only=True, poll_interval=0, name="x", name_start=3,
+                                     filesystems=[], each=True, dry_run=False)
+        with self.cloud(cloud), \
+             mock.patch.object(lg, "list_instance_types", lambda: caps(A=["us-east-1"], B=["us-east-1"])), \
+             mock.patch.object(lg, "launch_instances", launch), \
+             mock.patch.object(lg, "_report_launched", lambda *a, **k: None), \
+             mock.patch.object(lg, "notify", lambda m: None), \
+             mock.patch.object(lg.time, "time", lambda: next(clock)), \
+             mock.patch.object(lg.time, "monotonic", lambda: next(clock)), \
+             mock.patch.object(lg.time, "sleep", lambda s: None):
+            lg.poll_each(args)
+        self.assertEqual(posts, [("A", "x-003"), ("B", "x-004")])
+        self.assertEqual(sorted((i["instance_type"]["name"], i["name"]) for i in cloud), [("A", "x-003"), ("B", "x-004")])
 
 
 if __name__ == "__main__":

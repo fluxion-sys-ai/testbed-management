@@ -70,6 +70,14 @@ def _auth_header() -> dict:
     }
 
 
+class ApiHTTPError(RuntimeError):
+    """The API answered with an HTTP error status (the request was received and refused)."""
+
+    def __init__(self, code: int, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 def _request(method: str, path: str, body: dict | None = None, dry_run: bool = False):
     url = f"{BASE_URL}{path}"
     data = json.dumps(body).encode() if body else None
@@ -86,7 +94,7 @@ def _request(method: str, path: str, body: dict | None = None, dry_run: bool = F
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode(errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} {method} {url}: {body_text}") from exc
+        raise ApiHTTPError(exc.code, f"HTTP {exc.code} {method} {url}: {body_text}") from exc
 
 
 def list_instance_types() -> dict:
@@ -395,12 +403,52 @@ def instance_name(base: str, num: int, args, suffix: str = "") -> str:
     return f"{base}-{args.name_start + num - 1:03d}"
 
 
-def find_instance_by_name(name: str) -> str | None:
-    """ID of a non-terminated instance named `name`, if any (used as a launch idempotency check)."""
+def find_instance_by_name(name: str, type_name: str | None = None, region: str | None = None) -> str | None:
+    """ID of a non-terminated instance named `name`, if any (launch idempotency check). An instance with that name but
+    another instance type or region is not ours to adopt: stop for operator review rather than count or ignore it."""
     for inst in _request("GET", "/instances").get("data", []):
-        if inst.get("name") == name and inst.get("status") not in ("terminating", "terminated"):
-            return inst.get("id")
+        if inst.get("name") != name or inst.get("status") in ("terminating", "terminated"):
+            continue
+        it = (inst.get("instance_type") or {}).get("name")
+        rg = (inst.get("region") or {}).get("name")
+        if (type_name and it != type_name) or (region and rg != region):
+            notify(f"{name} exists as {it} in {rg}, not {type_name or 'the requested type'} in {region or 'any region'}: "
+                   f"name clash, stopped without launching. Check the Lambda console.")
+            sys.exit(4)
+        return inst.get("id")
     return None
+
+
+RECONCILE_SECONDS = 600   # how long to look for an instance whose launch request had an unknown outcome
+
+
+def is_definite_rejection(exc: Exception) -> bool:
+    """A 4xx answer means the launch was refused (no capacity, bad request, rate limit): safe to try again later.
+    Anything else (5xx, timeout, dropped connection, unreadable reply) may have launched an instance."""
+    return isinstance(exc, ApiHTTPError) and 400 <= exc.code < 500
+
+
+def resolve_unknown_launch(target: str, unique_names: bool, why, type_name: str | None = None,
+                           region: str | None = None) -> str:
+    """A launch request whose outcome is unknown is never sent again. With unique names, look for the instance by name
+    for RECONCILE_SECONDS (the instance list can lag) and adopt it; if it never shows up, stop for operator review."""
+    print(f"[{_ts()}] Launch of {target}: outcome unknown ({why}); not sending it again.")
+    if unique_names:
+        deadline = time.time() + RECONCILE_SECONDS
+        while True:
+            try:
+                iid = find_instance_by_name(target, type_name, region)
+                if iid:
+                    print(f"[{_ts()}] {target} exists ({iid}); adopting it.")
+                    return iid
+            except Exception as exc:
+                print(f"[{_ts()}] Lookup of {target} failed (will retry): {exc}")
+            if time.time() >= deadline:
+                break
+            time.sleep(15)
+    notify(f"Launch of {target} has an unknown outcome ({why}) and the instance did not appear by name. Stopped without "
+           f"retrying: check the Lambda console, then rerun with the right --count/--name-start.")
+    sys.exit(3)
 
 
 def await_instance(instance_ids: list[str], poll_interval: float) -> dict:
@@ -444,8 +492,22 @@ def poll_and_launch(args) -> None:
         print(f"[{_ts()}] Acquiring instance {instance_num}/{count} ({target})…")
         attempt = 0
         instance_ids: list[str] = []
-        # Phase 1: poll and launch. Retried until one launch request is accepted; nothing after that is retried here.
-        while True:
+        # Phase 0: an instance with this name may already exist (earlier run, or a launch whose reply was lost).
+        if unique_names and not args.dry_run:
+            while True:
+                try:
+                    existing = find_instance_by_name(target, wanted[0] if len(wanted) == 1 else None,
+                                                     args.region if args.region_only else None)
+                    break
+                except Exception as exc:
+                    print(f"[{_ts()}] Lookup of {target} failed (will retry): {exc}")
+                    time.sleep(max(args.poll_interval, 5))
+            if existing:
+                print(f"  {target} already exists ({existing}); adopting it, no new launch.")
+                instance_ids = [existing]
+        # Phase 1: poll and launch. Retried only while launches are refused outright; an accepted or unknown launch
+        # request is never sent again.
+        while not instance_ids:
             attempt += 1
             try:
                 instance_types = list_instance_types()
@@ -469,32 +531,33 @@ def poll_and_launch(args) -> None:
                         locked_region = region
 
                     print(f"[{_ts()}] CAPACITY FOUND: {type_name} in {region}")
-                    # A launch request that errored on our side (timeout, dropped connection) may still have been
-                    # accepted. With unique names the name tells: adopt the instance instead of launching another.
-                    existing = find_instance_by_name(target) if unique_names and not args.dry_run else None
-                    if existing:
-                        print(f"  {target} already exists ({existing}); adopting it, no new launch.")
-                        instance_ids = [existing]
-                        break
                     print(f"Launching instance {instance_num}/{count}…")
-
-                    instance_ids = launch_instances(
-                        instance_type=type_name,
-                        region=region,
-                        count=1,
-                        ssh_key=args.ssh_key,
-                        name=target,
-                        filesystem_ids=args.filesystems or [],
-                        dry_run=args.dry_run,
-                    )
-
-                    if args.dry_run:
-                        print(f"  [dry-run] Launch call complete for instance {instance_num}/{count}.")
+                    try:
+                        instance_ids = launch_instances(
+                            instance_type=type_name,
+                            region=region,
+                            count=1,
+                            ssh_key=args.ssh_key,
+                            name=target,
+                            filesystem_ids=args.filesystems or [],
+                            dry_run=args.dry_run,
+                        )
+                    except Exception as exc:
+                        if not is_definite_rejection(exc):
+                            instance_ids = [resolve_unknown_launch(target, unique_names, exc, type_name, region)]
+                            break
+                        print(f"[{_ts()}] Launch refused ({exc}); will try again when capacity shows.")
+                        instance_ids = []
+                    else:
+                        if args.dry_run:
+                            print(f"  [dry-run] Launch call complete for instance {instance_num}/{count}.")
+                            break
+                        if instance_ids:
+                            print(f"  Launched instance ID: {instance_ids}")
+                            break
+                        instance_ids = [resolve_unknown_launch(target, unique_names, "launch reply had no instance ID",
+                                                               type_name, region)]
                         break
-                    if instance_ids:
-                        print(f"  Launched instance ID: {instance_ids}")
-                        break
-                    print(f"[{_ts()}] Launch returned no instance ID; will retry.")
 
             except KeyboardInterrupt:
                 print("\nInterrupted by user. Exiting.")
@@ -593,6 +656,18 @@ def poll_each(args) -> None:
         remaining[type_name] = int(want) if want else args.count
     threads: list[threading.Thread] = []
     launched = 0   # across all types, for --name-start numbering
+    unique_names = getattr(args, "name_start", None) is not None
+    # Adopt instances that already carry the next names (earlier run, or a launch whose reply was lost) before polling.
+    if unique_names and not args.dry_run:
+        for type_name in list(remaining):
+            while remaining[type_name]:
+                existing = find_instance_by_name(instance_name(base, launched + 1, args, suffix=f"-{type_name}"),
+                                                 type_name, args.region if args.region_only else None)
+                if not existing:
+                    break
+                print(f"[{_ts()}] {instance_name(base, launched + 1, args)} already exists ({existing}); adopting it.", flush=True)
+                remaining[type_name] -= 1
+                launched += 1
 
     print(f"[{_ts()}] Polling every {args.poll_interval}s for: "
           + ", ".join(f"{n}× {t}" for t, n in remaining.items()))
@@ -616,13 +691,6 @@ def poll_each(args) -> None:
                     region = match[1]
                     print(f"[{_ts()}] CAPACITY FOUND: {type_name} in {region}", flush=True)
                     target = instance_name(base, launched + 1, args, suffix=f"-{type_name}")
-                    if getattr(args, "name_start", None) is not None and not args.dry_run:
-                        existing = find_instance_by_name(target)   # an earlier errored launch may have been accepted
-                        if existing:
-                            print(f"[{_ts()}] {target} already exists ({existing}); adopting it, no new launch.", flush=True)
-                            remaining[type_name] -= 1
-                            launched += 1
-                            continue
                     try:
                         instance_ids = launch_instances(
                             instance_type=type_name,
@@ -634,9 +702,16 @@ def poll_each(args) -> None:
                             dry_run=args.dry_run,
                         )
                     except Exception as exc:
-                        # Capacity races and launch rate limits are common; keep polling for it.
-                        print(f"[{_ts()}] Launch of {type_name} failed, still polling: {exc}", flush=True)
-                        continue
+                        if not is_definite_rejection(exc):
+                            # The request may have launched an instance: never send it again (adopt or stop).
+                            instance_ids = [resolve_unknown_launch(target, unique_names, exc, type_name, region)]
+                        else:
+                            # Capacity races and launch rate limits are common; keep polling for it.
+                            print(f"[{_ts()}] Launch of {type_name} refused, still polling: {exc}", flush=True)
+                            continue
+                    if not instance_ids and not args.dry_run:
+                        instance_ids = [resolve_unknown_launch(target, unique_names, "launch reply had no instance ID",
+                                                               type_name, region)]
                     remaining[type_name] -= 1
                     launched += 1
                     print(f"[{_ts()}] {type_name}: launched {instance_ids} "
